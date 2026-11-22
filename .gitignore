@@ -1,0 +1,10 @@
+# 凭证、收件箱、发件箱、日志：含敏感信息与运行态，绝不进 git
+state/
+inbox/
+outbox/
+logs/
+
+# 虚拟环境与 Python 缓存
+.venv/
+__pycache__/
+*.pyc
