@@ -1,0 +1,33 @@
+# 微信桥接收消息服务（serve）的 systemd 单元。
+# 规范本：这份文件是唯一正本，放 home 持久存储；/etc/systemd/system/
+# 里的只是部署副本（虚拟机替换后 /etc 会丢，看门狗 hook 会从这里重装）。
+# 为什么用 systemd（2026-11-23 实测结论）：
+#   - hook 脚本里 nohup/setsid 起 serve，会让本轮挂满 600 秒超时（执行器
+#     等后台进程退出才收尾），且超时强杀会把 serve 一起杀掉。
+#   - hook worker 起的 serve 活不过几分钟（worker 回收时连带杀掉）。
+#   - 只有 systemd（系统 manager 之外独立托管）能让 serve 真正常驻，
+#     崩了 10 秒内自起，不花 token、不依赖任何 agent。
+# 注意：StartLimitIntervalSec/StartLimitBurst 必须放 [Unit] 段，放 [Service]
+# 段会被忽略（2026-11-23 实测警告 Unknown key name）。
+# 注意：不要在这里写代理环境变量——出口代理密码会换，写死了几天就过期；
+# 代理地址由看门狗每分钟刷新到 state/proxy.env，bridge.py 每次请求现读。
+[Unit]
+Description=WeChat bridge serve (Muse iLink)
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+WorkingDirectory=/home/hatch/workspace/wechat-bridge
+ExecStart=/home/hatch/workspace/wechat-bridge/.venv/bin/python bridge.py serve
+Restart=always
+RestartSec=10
+TimeoutStopSec=45
+KillMode=control-group
+StandardOutput=append:/home/hatch/workspace/wechat-bridge/logs/serve.out
+StandardError=inherit
+
+[Install]
+WantedBy=default.target

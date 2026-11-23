@@ -13,6 +13,8 @@
 ⑤ 状态推进（received→executing→pending-send→sent，非法状态被拒绝）
 ⑥ send-once 只发一次（mock 发送：顺序调两次、并发调两次都只发一次；
    无 ret 但 HTTP 成功记 sent；失败留 pending-send 可重试；非文字无 ret 也记 sent）
+⑦ note 附加消息只发一次（mock 发送：同一个 key 顺序/并发调两次都只发一次，
+   不同 key 各发各的；不碰主状态；失败不记 key 可重试；非法 key 与空文本被拒绝）
 
 用法：.venv/bin/python selftest.py
 全部通过退出码 0，任一项失败退出码 1。
@@ -283,6 +285,125 @@ def test_send_once():
         assert status["8"]["status"] == "sent", "非文字无 ret 应记 sent"
 
 
+def test_note():
+    """⑦ note 附加消息只发一次（mock 发送，不真发）+ 不碰主状态。"""
+    with tempfile.TemporaryDirectory() as tmp:
+        b = _make_bridge(tmp)
+        inbox_file = Path(tmp) / "inbox" / "888.json"
+        inbox_file.write_text(json.dumps({
+            "message_id": 888, "from_user_id": "owner123",
+            "context_token": "ctx888", "text": "帮我推一下代码",
+        }, ensure_ascii=False), encoding="utf-8")
+        ack_file = Path(tmp) / "ack.txt"
+        ack_file.write_text("收到：推代码，约半小时后反馈。", encoding="utf-8")
+        b.set_status(888, "executing")
+
+        # 同一个 key 顺序调两次只发一次，不同 key 各发各的，无 ret 也算发出
+        calls = []
+
+        def mock_sender(to_user_id, context_token, text):
+            calls.append((to_user_id, context_token, text))
+            return True, False, "响应没有 ret 字段"
+
+        real_send = Bridge.send_message
+        Bridge.send_message = lambda self, to, ctx, text: mock_sender(to, ctx, text)
+        try:
+            args = argparse.Namespace(message_id="888", key="ack",
+                                      text_file=str(ack_file))
+            assert b.cmd_note(args) == 0, "第一次 note 应成功"
+            b2 = _make_bridge(tmp)  # 另一个实例模拟另一个发送者
+            assert b2.cmd_note(args) == 0, "同一个 key 第二次应跳过"
+            appr_file = Path(tmp) / "appr.txt"
+            appr_file.write_text("需要你在 Muse 里点一下确认。", encoding="utf-8")
+            args2 = argparse.Namespace(message_id="888", key="approval",
+                                       text_file=str(appr_file))
+            assert b.cmd_note(args2) == 0, "不同 key 应发出"
+        finally:
+            Bridge.send_message = real_send
+        assert len(calls) == 2, f"应恰好发送两次，实际 {len(calls)} 次"
+        assert calls[0][0] == "owner123"
+        assert calls[0][2] == "收到：推代码，约半小时后反馈。"
+        assert calls[1][2] == "需要你在 Muse 里点一下确认。"
+        status = json.loads((Path(tmp) / "state" / "status.json").read_text(encoding="utf-8"))
+        assert status["888"]["status"] == "executing", "note 不应碰主状态"
+        assert set(status["888"]["notes"]) == {"ack", "approval"}, "两个 key 都应记下"
+
+        # 并发调同一个 key，也只发一次
+        delay_file = Path(tmp) / "delay.txt"
+        delay_file.write_text("要晚一点，约一小时后反馈。", encoding="utf-8")
+        slow_calls = []
+
+        def slow_sender(to_user_id, context_token, text):
+            time.sleep(0.3)
+            slow_calls.append(text)
+            return True, True, ""
+
+        Bridge.send_message = lambda self, to, ctx, text: slow_sender(to, ctx, text)
+        try:
+            barrier = threading.Barrier(2)
+            results = []
+
+            def run_note(inst):
+                barrier.wait(timeout=5)
+                results.append(inst.cmd_note(argparse.Namespace(
+                    message_id="888", key="delay", text_file=str(delay_file))))
+
+            t1 = threading.Thread(target=run_note, args=(b,))
+            t2 = threading.Thread(target=run_note, args=(b2,))
+            t1.start()
+            t2.start()
+            t1.join(timeout=10)
+            t2.join(timeout=10)
+        finally:
+            Bridge.send_message = real_send
+        assert not t1.is_alive() and not t2.is_alive(), "并发调用不应卡死"
+        assert sorted(results) == [0, 0], f"并发调用都应返回 0：{results}"
+        assert len(slow_calls) == 1, f"并发应恰好发送一次，实际 {len(slow_calls)} 次"
+
+        # 发送失败时不记 key，允许重试
+        fail_calls = []
+
+        def fail_sender(to_user_id, context_token, text):
+            fail_calls.append(text)
+            return False, False, "网络错误"
+
+        Bridge.send_message = lambda self, to, ctx, text: fail_sender(to, ctx, text)
+        try:
+            retry_file = Path(tmp) / "retry.txt"
+            retry_file.write_text("收到，正在处理。", encoding="utf-8")
+            args3 = argparse.Namespace(message_id="888", key="retry",
+                                       text_file=str(retry_file))
+            assert b.cmd_note(args3) == 1, "发送失败应返回 1"
+        finally:
+            Bridge.send_message = real_send
+        assert len(fail_calls) == 1
+        status = json.loads((Path(tmp) / "state" / "status.json").read_text(encoding="utf-8"))
+        assert "retry" not in status["888"]["notes"], "失败不应记 key"
+        Bridge.send_message = lambda self, to, ctx, text: mock_sender(to, ctx, text)
+        try:
+            assert b.cmd_note(args3) == 0, "失败后重试应成功"
+        finally:
+            Bridge.send_message = real_send
+
+        # 非法 key 与空文本被拒绝
+        try:
+            b.cmd_note(argparse.Namespace(message_id="888", key="../x",
+                                          text_file=str(ack_file)))
+        except BridgeError:
+            pass
+        else:
+            raise AssertionError("非法 key 应被拒绝")
+        empty_file = Path(tmp) / "empty.txt"
+        empty_file.write_text("  \n", encoding="utf-8")
+        try:
+            b.cmd_note(argparse.Namespace(message_id="888", key="empty",
+                                          text_file=str(empty_file)))
+        except BridgeError:
+            pass
+        else:
+            raise AssertionError("空文本应被拒绝")
+
+
 TESTS = [
     ("① 二维码编解码往返与载荷判定", test_qr_roundtrip),
     ("② 消息过滤与非文字固定回复", test_filtering),
@@ -290,6 +411,7 @@ TESTS = [
     ("④ 单实例锁", test_single_instance_lock),
     ("⑤ 状态推进", test_state_machine),
     ("⑥ send-once 只发一次与无 ret 记 sent", test_send_once),
+    ("⑦ note 附加消息只发一次与不碰主状态", test_note),
 ]
 
 

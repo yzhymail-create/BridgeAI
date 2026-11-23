@@ -26,6 +26,7 @@ import argparse
 import base64
 import contextlib
 import fcntl
+import http.client
 import io
 import json
 import logging
@@ -173,6 +174,48 @@ def _write_json_0600(path, data):
     os.chmod(path, 0o600)
 
 
+def _proxy_opener_from_file():
+    """按请求建代理 opener：代理地址现读 state/proxy.env（看门狗每分钟刷新）。
+
+    原因：systemd 服务没有代理环境变量，且出口代理的密码会换；
+    进程启动时抓一次代理地址，几分钟后就过期。每次请求现读文件，
+    密码换了也不用重起 serve。文件不存在、读不出或内容为空时返回 None，
+    调用方回退到环境变量（urllib 默认行为）。绝不记录代理地址。
+    """
+    env_file = Path(__file__).resolve().parent / "state" / "proxy.env"
+    proxies = {}
+    try:
+        for line in env_file.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            key = key.strip().lower()
+            value = value.strip()
+            if not value:
+                continue
+            if key == "http_proxy":
+                proxies["http"] = value
+            elif key == "https_proxy":
+                proxies["https"] = value
+            elif key == "all_proxy":
+                proxies.setdefault("http", value)
+                proxies.setdefault("https", value)
+    except OSError:
+        return None
+    if not proxies:
+        return None
+    return urllib.request.build_opener(urllib.request.ProxyHandler(proxies))
+
+
+def _open_url(req, timeout):
+    """打开一个请求：优先用 proxy.env 里的现取代理，否则走环境变量。"""
+    opener = _proxy_opener_from_file()
+    if opener is not None:
+        return opener.open(req, timeout=timeout)
+    return urllib.request.urlopen(req, timeout=timeout)
+
+
 def _http_json(method, url, body=None, headers=None, timeout=35):
     """发一个 JSON 请求，返回解析后的响应字典。
 
@@ -184,11 +227,15 @@ def _http_json(method, url, body=None, headers=None, timeout=35):
         data = json.dumps(body, ensure_ascii=False).encode("utf-8")
     req = urllib.request.Request(url, data=data, headers=headers or {}, method=method)
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with _open_url(req, timeout=timeout) as resp:
             raw = resp.read().decode("utf-8")
     except urllib.error.HTTPError as exc:
         raise BridgeError(f"HTTP {exc.code}：{url}") from exc
-    except (urllib.error.URLError, TimeoutError) as exc:
+    except (urllib.error.URLError, TimeoutError, http.client.HTTPException,
+            OSError) as exc:
+        # RemoteDisconnected 等底层断连不会被 urllib 包成 URLError，
+        # 不接住会直接杀死 serve（2026-11-23 崩溃循环根因）；统一转
+        # BridgeError 后 cmd_serve 会 3 秒重试，不退出。
         raise BridgeError(f"网络错误：{exc}") from exc
     try:
         return json.loads(raw)
@@ -244,7 +291,7 @@ def _is_image_bytes(data):
 def _download_bytes(url, timeout=10, limit=2 * 1024 * 1024):
     """下载一个 URL，返回 (content_type, 字节串)。超限或失败抛异常。"""
     req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"}, method="GET")
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
+    with _open_url(req, timeout=timeout) as resp:
         content_type = resp.headers.get_content_type() or ""
         data = resp.read(limit + 1)
     if len(data) > limit:
@@ -869,6 +916,20 @@ class Bridge:
         self.log("warning", f"{label}消息 {mid} 固定回复发送失败，记 pending-send：{errmsg}")
         return f"replied-unconfirmed:{label}"
 
+    def _touch_heartbeat(self):
+        """心跳：每轮循环写一次当前时间戳，看门狗靠它判断循环是否卡住。
+
+        注意和 processed.json 的区别：processed 只在成功轮询后才写，
+        网络一断它就不动（循环本身还在跑）；心跳每轮都写，不管本轮
+        成功还是报错，只证明循环在转。写失败也不抛错，不拖垮 serve。
+        """
+        try:
+            (self.state_dir / "heartbeat").write_text(
+                str(int(time.time())), encoding="utf-8"
+            )
+        except OSError:
+            pass
+
     def cmd_serve(self):
         """收消息服务：长轮询 getUpdates，只收不执行。
 
@@ -890,6 +951,7 @@ class Bridge:
             print("serve 已启动，正在收消息…（Ctrl+C 停止）")
             self.log("info", "serve 已启动")
             while not self._stop:
+                self._touch_heartbeat()
                 try:
                     resp = self._get_updates(session, cursor, poll_timeout)
                 except BridgeError as exc:
@@ -1160,6 +1222,54 @@ class Bridge:
             print(f"发送失败：{errmsg}", file=sys.stderr)
             return 1
 
+    def cmd_note(self, args):
+        """发一条附加消息（收到确认、授权提醒、超时说明等），
+        按 (message_id, key) 只发一次。
+
+        与 send-once 的区别：不碰主状态、不记 sent，只在状态条目里记
+        notes[key]=发送时间；同一个 key 发过就跳过，不同 key 各发各的。
+        查 notes、发消息、记 notes 在同一把状态锁里完成，两个发送者同时调
+        也不会发两遍。HTTP 成功即记已发，不等 ret；失败不记 key，可重试。
+        文本从 --text-file 读，不给则从 stdin 读。
+        """
+        message_id = str(args.message_id)
+        key = str(args.key)
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}", key):
+            raise BridgeError("key 只能用字母、数字、-、_，1~64 个字符")
+        if args.text_file:
+            text = Path(args.text_file).read_text(encoding="utf-8")
+        else:
+            text = sys.stdin.read()
+        text = text.rstrip("\n")
+        if not text.strip():
+            raise BridgeError("要发送的文本为空")
+        with self._status_lock():
+            data = self._load_status()
+            entry = data.get(message_id) or {}
+            notes = entry.get("notes") or {}
+            if key in notes:
+                print(f"{message_id} 的 {key} 已发过，跳过。")
+                return 0
+            inbox_file = self.inbox_dir / f"{message_id}.json"
+            if not inbox_file.exists():
+                raise BridgeError(f"inbox 里没有 {message_id}，无法发送")
+            record = json.loads(inbox_file.read_text(encoding="utf-8"))
+            if not record.get("from_user_id"):
+                raise BridgeError(f"inbox 里 {message_id} 缺少 from_user_id")
+            ok, confirmed, errmsg = self.send_message(
+                record.get("from_user_id"), record.get("context_token") or "", text
+            )
+            if ok:
+                notes[key] = _now_iso()
+                entry["notes"] = notes
+                data[message_id] = entry
+                _atomic_write_json(self.state_dir / "status.json", data)
+                self.log("info", f"{message_id} 附加消息 {key} 已发出（{len(text)} 字）")
+                print(f"{message_id} 的 {key} 已发出。")
+                return 0
+            print(f"发送失败：{errmsg}", file=sys.stderr)
+            return 1
+
     # -- 命令：status ---------------------------------------------------------
 
     def cmd_status(self):
@@ -1252,6 +1362,14 @@ def build_parser():
         "send-once", help="按消息 ID 只发一次（查状态→发→记 sent，全程加锁防重发）")
     send_once_parser.add_argument("message_id", help="消息 ID（inbox/outbox 里的文件名）")
 
+    note_parser = sub.add_parser(
+        "note", help="发一条附加消息（收到确认/授权提醒），按 (消息 ID, key) 只发一次，不碰主状态")
+    note_parser.add_argument("message_id", help="消息 ID（inbox 里的文件名）")
+    note_parser.add_argument("--key", required=True,
+                             help="附加消息的键，如 ack、approval、delay；同一个键只发一次")
+    note_parser.add_argument("--text-file", default="",
+                             help="文本文件路径；不给则从 stdin 读")
+
     send_media_parser = sub.add_parser(
         "send-media", help="发图片/文件给指定用户（先上传 CDN 再发送）")
     send_media_parser.add_argument("--to", required=True, help="目标用户 ID（to_user_id）")
@@ -1286,6 +1404,8 @@ def main(argv=None):
             return bridge.cmd_send(args)
         if args.command == "send-once":
             return bridge.cmd_send_once(args)
+        if args.command == "note":
+            return bridge.cmd_note(args)
         if args.command == "send-media":
             return bridge.cmd_send_media(args)
         if args.command == "status":

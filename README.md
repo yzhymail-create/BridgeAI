@@ -75,6 +75,20 @@ nohup .venv/bin/python bridge.py serve >> logs/serve.out 2>&1 &
   只有命令报错（网络不通、非零 `ret`）才留在 `pending-send`。
 - 每次发送都在 `logs/bridge.log` 记一条（只记字数与结果，不记内容）。
 
+附加消息（收到确认、授权提醒、超时说明）用 `note`，不走 `send-once`：
+
+```bash
+printf '%s' '收到：推代码，约半小时后反馈。' | .venv/bin/python bridge.py note <message_id> --key ack
+```
+
+- 按 `(message_id, key)` 只发一次：同一个 key 发过就跳过，不同 key 各发各的；
+  常用 key：`ack`（收到确认）、`approval`（授权提醒）、`delay`（超时说明）。
+- 不碰主状态、不记 `sent`，只记 `notes[key]=发送时间`；HTTP 成功即记已发，
+  失败不记 key，可重试。文本含单引号时改写临时文件走 `--text-file`。
+- 顺序是固定的：需要干活的任务先发 `ack`（带任务简述和预计反馈时间）再干活，
+  最后 `send-once` 回结果；写操作要确认时先发 `approval` 提醒再调接口；
+  快超时先发 `delay` 说明新时间。详见 `docs/需求说明.md` §十五。
+
 底层命令 `send --to <用户ID> --context-token <令牌> --text-file <文件>`
 只做单次发送、不查状态，日常不要直接用（令牌从 inbox 文件里取，不要贴进聊天记录）。
 
@@ -144,13 +158,14 @@ kill <PID>                          # 优雅停止（SIGTERM）
 ## 自测
 
 ```bash
-.venv/bin/python selftest.py          # 文字收发与防重发，6 项
+.venv/bin/python selftest.py          # 文字收发与防重发，7 项
 .venv/bin/python selftest_media.py    # 图片/文件收发，8 项
 ```
 
 不调登录接口、不生成真实二维码、不联网发消息。
-自测 6 项：二维码编解码往返与载荷判定、消息过滤与非文字固定回复、
-redact 脱敏、单实例锁、状态推进、send-once 只发一次与无 ret 记 sent。
+自测 7 项：二维码编解码往返与载荷判定、消息过滤与非文字固定回复、
+redact 脱敏、单实例锁、状态推进、send-once 只发一次与无 ret 记 sent、
+note 附加消息只发一次与不碰主状态。
 媒体自测 8 项：AES 加密往返与密钥解码、上传参数构造与文件名判定、
 CDN 上传/下载 URL 构造、CDN 上传重试行为、发送体结构与说明文字顺序、
 接收下载解密往返、收消息集成（图片/文件进 inbox）、send-once 媒体防重发。
