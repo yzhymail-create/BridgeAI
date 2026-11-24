@@ -15,6 +15,8 @@
    无 ret 但 HTTP 成功记 sent；失败留 pending-send 可重试；非文字无 ret 也记 sent）
 ⑦ note 附加消息只发一次（mock 发送：同一个 key 顺序/并发调两次都只发一次，
    不同 key 各发各的；不碰主状态；失败不记 key 可重试；非法 key 与空文本被拒绝）
+⑧ 只重试 407（最多 3 次、各等 5 秒）；连接中断与服务端错误不重试
+   （中断时消息可能已发出，重试会把同一条消息再发一遍）
 
 用法：.venv/bin/python selftest.py
 全部通过退出码 0，任一项失败退出码 1。
@@ -404,6 +406,78 @@ def test_note():
             raise AssertionError("空文本应被拒绝")
 
 
+def test_http_json_proxy_retry():
+    """⑧ 只重试 407；连接中断与服务端错误不重试（中断时消息可能已发出）。"""
+    import urllib.error
+
+    class FakeResp:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def read(self):
+            return b'{"ret": 0}'
+
+    calls = {"n": 0}
+    sleeps = []
+
+    def flaky_open(req, timeout):
+        calls["n"] += 1
+        if calls["n"] <= 2:
+            raise urllib.error.HTTPError(
+                req.full_url, 407, "Proxy Auth Required", {}, None)
+        return FakeResp()
+
+    real_open = bridge._open_url
+    real_sleep = bridge.time.sleep
+    bridge._open_url = flaky_open
+    bridge.time.sleep = lambda s: sleeps.append(s)
+    try:
+        out = bridge._http_json("GET", "https://example.invalid/x")
+        assert out == {"ret": 0}, "两次 407 后应成功"
+        assert calls["n"] == 3, f"应调 3 次，实际 {calls['n']} 次"
+        assert sleeps == [5, 5], f"两次重试各等 5 秒，实际 {sleeps}"
+        # 服务端 500 不重试
+        calls["n"] = 0
+        sleeps.clear()
+
+        def err500(req, timeout):
+            calls["n"] += 1
+            raise urllib.error.HTTPError(
+                req.full_url, 500, "Server Error", {}, None)
+
+        bridge._open_url = err500
+        try:
+            bridge._http_json("GET", "https://example.invalid/x")
+            raise AssertionError("500 应抛错")
+        except BridgeError as exc:
+            assert "500" in str(exc), "500 应原样抛错"
+        assert calls["n"] == 1, "500 不应重试"
+        assert sleeps == [], "500 不应等"
+        # 连接中断不重试：消息可能已发出，重试会重发
+        calls["n"] = 0
+        sleeps.clear()
+
+        def closed(req, timeout):
+            calls["n"] += 1
+            raise urllib.error.URLError(
+                "Remote end closed connection without response")
+
+        bridge._open_url = closed
+        try:
+            bridge._http_json("GET", "https://example.invalid/x")
+            raise AssertionError("连接中断应抛错")
+        except BridgeError as exc:
+            assert "Remote end closed" in str(exc), "中断应原样抛错"
+        assert calls["n"] == 1, "连接中断不应重试"
+        assert sleeps == [], "连接中断不应等"
+    finally:
+        bridge._open_url = real_open
+        bridge.time.sleep = real_sleep
+
+
 TESTS = [
     ("① 二维码编解码往返与载荷判定", test_qr_roundtrip),
     ("② 消息过滤与非文字固定回复", test_filtering),
@@ -412,6 +486,7 @@ TESTS = [
     ("⑤ 状态推进", test_state_machine),
     ("⑥ send-once 只发一次与无 ret 记 sent", test_send_once),
     ("⑦ note 附加消息只发一次与不碰主状态", test_note),
+    ("⑧ 只重试 407，连接中断与服务端错误不重试", test_http_json_proxy_retry),
 ]
 
 

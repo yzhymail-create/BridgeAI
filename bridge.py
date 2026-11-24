@@ -175,12 +175,16 @@ def _write_json_0600(path, data):
 
 
 def _proxy_opener_from_file():
-    """按请求建代理 opener：代理地址现读 state/proxy.env（看门狗每分钟刷新）。
+    """按请求建代理 opener：代理地址现读 state/proxy.env（在线 agent 轮值刷新）。
 
     原因：systemd 服务没有代理环境变量，且出口代理的密码会换；
     进程启动时抓一次代理地址，几分钟后就过期。每次请求现读文件，
     密码换了也不用重起 serve。文件不存在、读不出或内容为空时返回 None，
     调用方回退到环境变量（urllib 默认行为）。绝不记录代理地址。
+    注意（2026-11-24）：不要让看门狗 hook 或 cron 去刷新这个文件——
+    后台环境的代理密码到手就是死的（实测 1 秒内 407），写进去只会把
+    好密码盖掉；刷新只能由在线聊天的 agent 从自己的环境做
+    （scripts/refresh_proxy_env.sh）。
     """
     env_file = Path(__file__).resolve().parent / "state" / "proxy.env"
     proxies = {}
@@ -221,22 +225,37 @@ def _http_json(method, url, body=None, headers=None, timeout=35):
 
     只用标准库 urllib。HTTP 错误与网络错误统一转成 BridgeError，
     错误里不带响应正文（正文里可能含凭证）。
+    只重试 407（代理拒绝建隧道，请求根本没到微信服务端，肯定没发出去，
+    重试安全）。连接中断（Remote end closed 等）绝不重试：请求可能已经
+    到达、消息可能已经发出，只是回执丢了，重试会把同一条消息再发一遍
+    （2026-11-24 教训：今早一条回复被重试 3 次，用户收到多遍）。
+    getUpdates 不用这里重试，cmd_serve 自己每 3 秒重试。
     """
     data = None
     if body is not None:
         data = json.dumps(body, ensure_ascii=False).encode("utf-8")
     req = urllib.request.Request(url, data=data, headers=headers or {}, method=method)
-    try:
-        with _open_url(req, timeout=timeout) as resp:
-            raw = resp.read().decode("utf-8")
-    except urllib.error.HTTPError as exc:
-        raise BridgeError(f"HTTP {exc.code}：{url}") from exc
-    except (urllib.error.URLError, TimeoutError, http.client.HTTPException,
-            OSError) as exc:
-        # RemoteDisconnected 等底层断连不会被 urllib 包成 URLError，
-        # 不接住会直接杀死 serve（2026-11-23 崩溃循环根因）；统一转
-        # BridgeError 后 cmd_serve 会 3 秒重试，不退出。
-        raise BridgeError(f"网络错误：{exc}") from exc
+    last_error = None
+    for attempt in range(3):
+        try:
+            with _open_url(req, timeout=timeout) as resp:
+                raw = resp.read().decode("utf-8")
+            break
+        except urllib.error.HTTPError as exc:
+            if exc.code == 407 and attempt < 2:
+                last_error = f"HTTP {exc.code}：{url}"
+                time.sleep(5)
+                continue
+            raise BridgeError(f"HTTP {exc.code}：{url}") from exc
+        except (urllib.error.URLError, TimeoutError, http.client.HTTPException,
+                OSError) as exc:
+            # RemoteDisconnected 等底层断连不会被 urllib 包成 URLError，
+            # 不接住会直接杀死 serve（2026-11-23 崩溃循环根因）；统一转
+            # BridgeError 后 cmd_serve 会 3 秒重试，不退出。
+            # 这里不重试：断连时消息可能已发出，重试会重发（见上）。
+            raise BridgeError(f"网络错误：{exc}") from exc
+    else:
+        raise BridgeError(last_error or "网络错误")
     try:
         return json.loads(raw)
     except ValueError as exc:
@@ -1201,6 +1220,7 @@ class Bridge:
                     print(f"{message_id} 已发出，记 sent。")
                     return 0
                 self.set_status(message_id, "pending-send", note=errmsg)
+                self.log("warning", f"{message_id} 媒体发送失败：{errmsg}")
                 print(f"发送失败：{errmsg}", file=sys.stderr)
                 return 1
             outbox_file = self.outbox_dir / f"{message_id}.txt"
@@ -1219,6 +1239,7 @@ class Bridge:
                 print(f"{message_id} 已发出，记 sent。")
                 return 0
             self.set_status(message_id, "pending-send", note=errmsg)
+            self.log("warning", f"{message_id} 发送失败：{errmsg}")
             print(f"发送失败：{errmsg}", file=sys.stderr)
             return 1
 
@@ -1267,6 +1288,7 @@ class Bridge:
                 self.log("info", f"{message_id} 附加消息 {key} 已发出（{len(text)} 字）")
                 print(f"{message_id} 的 {key} 已发出。")
                 return 0
+            self.log("warning", f"{message_id} 附加消息 {key} 发送失败：{errmsg}")
             print(f"发送失败：{errmsg}", file=sys.stderr)
             return 1
 
