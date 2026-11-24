@@ -1,5 +1,0 @@
-# 微信桥接依赖（装进本目录的 .venv：.venv/bin/pip install -r requirements.txt）
-# 桥接本身只用标准库；这三样是登录二维码与媒体加密用的。
-qrcode[pil]          # 二维码生成（login 命令）
-opencv-python-headless  # 二维码解码（自测里验二维码能扫）
-pycryptodome         # AES-128-ECB 加密/解密（媒体收发，media.py）
