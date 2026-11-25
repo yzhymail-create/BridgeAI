@@ -6,8 +6,8 @@
 # 承诺了几分钟没写明时按 15 分钟记。只在确实发了确认邮件、承诺了
 # 时间时才记；没承诺时间的不记。
 # 记一条 JSON 行到 $STATE_DIR/promises.jsonl；监测脚本每轮（60 秒）
-# 查发件箱：到时间还没发出就发微信提醒一次，之后每分钟继续查，
-# 直到发出为止。
+# 查发件箱：到时间还没发出就叫醒处理方发一封邮件说明（邮箱的事用
+# 邮箱反馈，不发微信），之后每分钟继续查，直到发出为止。
 set -euo pipefail
 
 STATE_DIR="${MAIL_WATCH_STATE_DIR:-$HOME/hooks/state/muse-mail-inbox-watch}"

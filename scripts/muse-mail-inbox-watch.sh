@@ -7,7 +7,8 @@
 # 2026-11-25 加：承诺定时检查。回确认邮件、承诺了几分钟后反馈时，
 # 处理方用 record-mail-promise.sh 记下承诺（thread_id、承诺分钟数）；
 # 本脚本每轮（60 秒）先查承诺：到时间还没在发件箱看到结果邮件，
-# 就发微信提醒一次，之后每分钟继续查，直到发出为止才停。
+# 就叫醒处理方，给用户发一封邮件说明还没发出（邮箱的事用邮箱反馈，
+# 不发微信），之后每分钟继续查，直到发出为止才停。
 # 判定“已发出”：同一 thread 里、确认邮件发出 60 秒之后有 OUTBOUND
 # 邮件。60 秒宽限是排除确认邮件本身（服务器时间与本地记账时间
 # 可能差几秒）；承诺了几分钟的活，结果不可能 60 秒内就发出来。
@@ -17,7 +18,6 @@ source "$HATCH_HOOK_RUNTIME"
 STATE_DIR="${MAIL_WATCH_STATE_DIR:-$HOME/hooks/state/muse-mail-inbox-watch}"
 SEEN_FILE="$STATE_DIR/seen_ids.txt"
 PROMISES_FILE="$STATE_DIR/promises.jsonl"
-BRIDGE_DIR="$HOME/workspace/wechat-bridge"
 mkdir -p "$STATE_DIR"
 
 TMP="$(mktemp)"
@@ -31,7 +31,7 @@ if ! /opt/hatch/bin/muse-mail messages list --limit 25 > "$TMP" 2>"$TMP_ERR"; th
 fi
 
 # ---- 承诺定时检查：先于收件箱检查跑，wake 会直接退出脚本 ----
-# 返回：0=本轮无须叫醒；1=须叫醒（提醒发不出去、改走主聊天）。
+# 返回：0=本轮无须叫醒；1=须叫醒（叫醒处理方给用户发邮件说明）。
 # 全局变量 WAKE_PAYLOAD 供调用方在承诺文件落盘后再 wake。
 WAKE_PAYLOAD=""
 check_promises() {
@@ -66,32 +66,18 @@ check_promises() {
       printf '%s\n' "$line" >> "$tmp_promises"
       continue
     fi
-    # 到时间还没发出：只提醒一次，之后每分钟继续查、直到发出为止。
+    # 到时间还没发出：只叫醒一次（发邮件说明），之后每分钟继续查、
+    # 直到发出为止。邮箱的事用邮箱反馈，不发微信。
     if [ "$alerted" = "true" ]; then
       printf '%s\n' "$line" >> "$tmp_promises"
       continue
     fi
-    local overdue_min alert_rc
+    local overdue_min
     overdue_min=$(( (now - deadline) / 60 ))
-    if send_overdue_alert "$subject" "$minutes" "$overdue_min"; then
-      alert_rc=0
-    else
-      alert_rc=$?
-    fi
-    if [ "$alert_rc" -eq 0 ]; then
-      printf '%s\n' "$line" | jq -c '.alerted = true' >> "$tmp_promises"
-      log "mail promise alert sent" "{\"thread_id\":\"$thread_id\"}"
-    elif [ "$alert_rc" -eq 2 ]; then
-      # 407 两次：肯定没发出去，下轮再试，不叫醒。
-      printf '%s\n' "$line" >> "$tmp_promises"
-      log "mail promise alert 407, retry next round" "{\"thread_id\":\"$thread_id\"}"
-    else
-      # 发没发出去不知道（连接中断）：不再重发，记已提醒、改走主聊天。
-      printf '%s\n' "$line" | jq -c '.alerted = true' >> "$tmp_promises"
-      WAKE_PAYLOAD="$(jq -cn --arg s "$subject" --argjson m "$minutes" --argjson o "$overdue_min" \
-        '{overdue_mail: {subject: $s, promised_minutes: $m, overdue_minutes: $o}, note: "wechat alert send uncertain, please check sent box and notify user"}')"
-      log "mail promise alert uncertain, wake main" "{\"thread_id\":\"$thread_id\"}"
-    fi
+    printf '%s\n' "$line" | jq -c '.alerted = true' >> "$tmp_promises"
+    WAKE_PAYLOAD="$(jq -cn --arg t "$thread_id" --arg s "$subject" --argjson m "$minutes" --argjson o "$overdue_min" \
+      '{overdue_mail: {thread_id: $t, subject: $s, promised_minutes: $m, overdue_minutes: $o}, note: "promised email result still unsent; send the user a brief status email in this thread saying it is delayed (and why, if known)"}')"
+    log "mail promise overdue, wake to email user" "{\"thread_id\":\"$thread_id\"}"
   done < "$PROMISES_FILE"
   if [ "${HATCH_HOOK_DRY_RUN:-0}" != "1" ]; then
     mv -f "$tmp_promises" "$PROMISES_FILE"
@@ -100,42 +86,6 @@ check_promises() {
     return 1
   fi
   return 0
-}
-
-# 发一条微信超时提醒。返回 0=已发出；2=407 两次都没出去；3=连接中断、
-# 发没发出去不知道。提醒文本走临时文件，不进 shell 历史。
-send_overdue_alert() { # $1=subject $2=minutes $3=overdue_min
-  local subject="$1" minutes="$2" overdue_min="$3"
-  local latest to_user ctx alert_file err_file rc
-  if [ "${MAIL_WATCH_ALERT_DRY_RUN:-0}" = "1" ]; then
-    printf '%s' "提醒：答应你 ${minutes} 分钟内回的《${subject}》，到现在 ${overdue_min} 分钟了还没发出，我在盯着，每分钟查一次，发出为止。" \
-      > "$STATE_DIR/last_alert_dryrun.txt"
-    return 0
-  fi
-  latest="$(ls -t "$BRIDGE_DIR"/inbox/*.json 2>/dev/null | head -1 || true)"
-  [ -n "$latest" ] || return 3
-  to_user="$(jq -r '.from_user_id // empty' "$latest" 2>/dev/null || true)"
-  ctx="$(jq -r '.context_token // empty' "$latest" 2>/dev/null || true)"
-  [ -n "$to_user" ] || return 3
-  alert_file="$(mktemp)"
-  err_file="$(mktemp)"
-  printf '%s' "提醒：答应你 ${minutes} 分钟内回的《${subject}》，到现在 ${overdue_min} 分钟了还没发出，我在盯着，每分钟查一次，发出为止。" > "$alert_file"
-  if "$BRIDGE_DIR/.venv/bin/python" "$BRIDGE_DIR/bridge.py" send --to "$to_user" --context-token "$ctx" --text-file "$alert_file" > /dev/null 2>"$err_file"; then
-    rc=0
-  elif grep -q "407" "$err_file" 2>/dev/null; then
-    # 407 是代理拒绝，肯定没发出去，重试一次。
-    if "$BRIDGE_DIR/.venv/bin/python" "$BRIDGE_DIR/bridge.py" send --to "$to_user" --context-token "$ctx" --text-file "$alert_file" > /dev/null 2>"$err_file"; then
-      rc=0
-    elif grep -q "407" "$err_file" 2>/dev/null; then
-      rc=2
-    else
-      rc=3
-    fi
-  else
-    rc=3
-  fi
-  rm -f "$alert_file" "$err_file"
-  return "$rc"
 }
 
 if ! check_promises; then
