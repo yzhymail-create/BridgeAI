@@ -74,6 +74,13 @@ nohup .venv/bin/python bridge.py serve >> logs/serve.out 2>&1 &
 - HTTP 成功即记 `sent`，不等 `ret`（微信经常不回 `ret`，实测没 `ret` 也能收到）。
   只有命令报错（网络不通、非零 `ret`）才留在 `pending-send`。
 - 每次发送都在 `logs/bridge.log` 记一条（只记字数与结果，不记内容）。
+- 正文守卫：所有文本发送（`send-once`、`note`、`send`、媒体说明文字）发出前
+  先校验正文，去掉首尾空白后为空、或以 `--` 开头一律拒发并记审计日志
+  （只记原因与字数，不记内容）。防的是命令参数（如 `--key`）误入正文
+  被当消息发出去（借鉴 wechat-ilink-muse-bridge 的守卫，2026-11-26）。
+- 正在输入：`note --key ack` 发出后自动亮起“对方正在输入”，
+  `send-once` 发出后自动熄灭；ticket 缓存约 9 分钟，失败静默降级，
+  不影响回复。worker 不用管，bridge.py 自动处理。
 
 附加消息（收到确认、授权提醒、超时说明）用 `note`，不走 `send-once`：
 
@@ -115,8 +122,19 @@ printf '%s' '收到：推代码，约半小时后反馈。' | .venv/bin/python b
 ### 5. 推进消息状态（供外部 worker 调用）
 
 ```bash
-.venv/bin/python bridge.py mark <message_id> received|executing|pending-send|sent
+.venv/bin/python bridge.py mark <message_id> received|executing|pending-send|sent|merged [--note "备注"]
 ```
+
+连发合并：用户连发多条时只回一条。worker 用 `pending` 查同发送人
+待处理消息定批次，同批只对最新一条发 `ack` 和 `send-once`，
+其余逐条 `mark <message_id> merged --note '已合并到 <最新 message_id>'`
+（标记后不再唤醒）：
+
+```bash
+.venv/bin/python bridge.py pending [--from <from_user_id>]   # JSON 数组，按时间升序
+```
+
+批次判定与行为边界见 `docs/需求说明.md` §十七。
 
 ## 停止 serve
 
@@ -169,14 +187,16 @@ cron agent 的环境密码到手就是死的，2026-11-24 实测，写进去只�
 ## 自测
 
 ```bash
-.venv/bin/python selftest.py          # 文字收发与防重发，8 项
+.venv/bin/python selftest.py          # 文字收发与防重发，11 项
 .venv/bin/python selftest_media.py    # 图片/文件收发，8 项
 ```
 
 不调登录接口、不生成真实二维码、不联网发消息。
-自测 8 项：二维码编解码往返与载荷判定、消息过滤与非文字固定回复、
+自测 11 项：二维码编解码往返与载荷判定、消息过滤与非文字固定回复、
 redact 脱敏、单实例锁、状态推进、send-once 只发一次与无 ret 记 sent、
-note 附加消息只发一次与不碰主状态、只重试 407 与连接中断不重试。
+note 附加消息只发一次与不碰主状态、只重试 407 与连接中断不重试、
+正文守卫拒发空正文与 -- 开头、正在输入 payload/缓存/静默降级与挂接点、
+连发合并支撑 pending 与 merged 状态。
 媒体自测 8 项：AES 加密往返与密钥解码、上传参数构造与文件名判定、
 CDN 上传/下载 URL 构造、CDN 上传重试行为、发送体结构与说明文字顺序、
 接收下载解密往返、收消息集成（图片/文件进 inbox）、send-once 媒体防重发。

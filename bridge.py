@@ -17,8 +17,8 @@ https://github.com/tencent/openclaw-weixin/blob/HEAD/docs/protocol_zh_CN.md
 - login 只在用户说“手机在手边，马上扫”之后由主聊天触发；
   二维码过期不自动重生成，不自动循环登录流程。
 
-子命令：login / wait-login / serve / send / send-once / send-media /
-status / mark。图片与文件的编解码、上传下载在 media.py。
+子命令：login / wait-login / serve / send / send-once / note / send-media /
+status / pending / mark。图片与文件的编解码、上传下载在 media.py。
 用法见 README.md。
 """
 
@@ -87,10 +87,23 @@ NON_TEXT_REPLY = "语音和视频暂时还不能处理，请先用文字描述"
 DOWNLOAD_FAILED_REPLY = "刚才的图片/文件没能下载下来，请再发一次"
 
 # 消息状态机（state/status.json 按 message_id 记录）
-STATUSES = ("received", "executing", "pending-send", "sent")
+# merged：连发合并时被并入最新一条处理的消息，不单独回复、不再唤醒
+STATUSES = ("received", "executing", "pending-send", "sent", "merged")
 
 # 已处理消息 ID 最多保留条数（防 processed.json 无限长大）
 PROCESSED_KEEP = 5000
+
+# typing ticket 缓存时长（秒）：getConfig 取到的 typing_ticket 约 9 分钟内复用，
+# 过期自动重新取（借鉴 wechat-ilink-muse-bridge 的缓存做法，2026-11-26）
+TYPING_TICKET_TTL = 540
+
+# sendTyping 的 status 值（协议“sendTyping”一节：1 正在输入，2 取消输入）
+TYPING_STATUS_START = 1
+TYPING_STATUS_CANCEL = 2
+
+# getConfig / sendTyping 的单次超时（秒）：typing 只是锦上添花，
+# 超时要短，失败静默降级，绝不拖慢回复
+TYPING_HTTP_TIMEOUT = 5
 
 
 class BridgeError(Exception):
@@ -291,6 +304,22 @@ def _auth_headers(token):
 def _base_info():
     """鉴权 POST 请求体里带的公共元数据。"""
     return {"channel_version": CHANNEL_VERSION, "bot_agent": BOT_AGENT}
+
+
+def _body_guard_error(text):
+    """正文守卫：校验要发出的文本正文，违规返回中文原因，合法返回 None。
+
+    规则（借鉴 wechat-ilink-muse-bridge，2026-11-26）：去掉首尾空白后
+    为空、或以 "--" 开头，一律拒发。源于对方项目 2026-10-27 的事故：
+    worker 拼命令漏了正文占位符，防重复的 --key 被当正文发了出去；
+    我们也有 --key 机制，同样的坑必须堵住。
+    所有文本发送路径（send-once、note、send、媒体说明文字）都过这道守卫。
+    """
+    if not isinstance(text, str) or not text.strip():
+        return "正文为空，正文守卫拒发"
+    if text.strip().startswith("--"):
+        return "正文以 -- 开头（疑似命令参数误入正文），正文守卫拒发"
+    return None
 
 
 def _is_image_bytes(data):
@@ -557,6 +586,33 @@ class Bridge:
                 _atomic_write_json(inbox_file, record)
             except (OSError, ValueError):
                 pass
+
+    def list_pending(self, from_user_id=None):
+        """列出状态为 received 的待处理消息（连发合并的批次判定支撑）。
+
+        返回按 (create_time_ms, message_id) 升序的列表，每项含
+        message_id、from_user_id、create_time_ms、type。
+        from_user_id 不为空时只列该发送人的。批次判定（worker 侧执行）：
+        同一发送人在 worker 开始处理时、以及最终发送前复查时仍为
+        received 的消息算同一批，只回最新一条，其余标记 merged。
+        """
+        data = self._load_status()
+        pending = []
+        for mid, entry in data.items():
+            if not isinstance(entry, dict) or entry.get("status") != "received":
+                continue
+            record = _load_json(self.inbox_dir / f"{mid}.json") or {}
+            sender = record.get("from_user_id") or ""
+            if from_user_id and sender != from_user_id:
+                continue
+            pending.append({
+                "message_id": mid,
+                "from_user_id": sender,
+                "create_time_ms": record.get("create_time_ms"),
+                "type": record.get("type") or "",
+            })
+        pending.sort(key=lambda p: (p["create_time_ms"] or 0, str(p["message_id"])))
+        return pending
 
     # -- 二维码 -------------------------------------------------------------
 
@@ -1062,7 +1118,18 @@ class Bridge:
         return True, True, ""
 
     def send_message(self, to_user_id, context_token, text):
-        """发一条文本消息。返回 (ok, confirmed, errmsg)，含义见 _post_send_message。"""
+        """发一条文本消息。返回 (ok, confirmed, errmsg)，含义见 _post_send_message。
+
+        发出前先过正文守卫（_body_guard_error）：为空或以 -- 开头一律拒发，
+        记审计日志（只记原因与字数，不记内容），返回 ok=False。
+        这是所有文本发送路径的统一入口（send-once、note、send、媒体说明文字、
+        固定回复都走这里），守卫只在这里实现一处。
+        """
+        guard_error = _body_guard_error(text)
+        if guard_error:
+            self.log("warning",
+                     f"正文守卫拒发：{guard_error}（{len(text or '')} 字，未发出）")
+            return False, False, guard_error
         msg = self._build_outbound_msg(
             to_user_id, context_token,
             [{"type": 1, "text_item": {"text": text}}])
@@ -1072,6 +1139,83 @@ class Bridge:
         """发一条单 item 消息（图片/文件等媒体项）。返回同 send_message。"""
         msg = self._build_outbound_msg(to_user_id, context_token, [item])
         return self._post_send_message(msg, log_label)
+
+    # -- 正在输入（typing） ---------------------------------------------------
+    # 协议依据（腾讯 openclaw-weixin 协议文档 getConfig / sendTyping 两节）：
+    # - POST /ilink/bot/getconfig，请求体 {ilink_user_id, context_token（可选）,
+    #   base_info}，响应 {ret: 0, typing_ticket}；缓存层只在 ret===0 时接受。
+    # - POST /ilink/bot/sendtyping，请求体 {ilink_user_id, typing_ticket,
+    #   status（1 正在输入 / 2 取消输入）, base_info}；官方包装函数不解析
+    #   响应体、不检查业务返回码。
+    # 挂接点：note --key ack 发出后亮起（start），send-once 发出后熄灭（cancel）。
+    # 任何失败一律静默降级（返回 False），绝不阻塞回复、不抛错。
+
+    @property
+    def typing_ticket_path(self):
+        """typing ticket 缓存文件路径（state/typing_ticket.json，0600 存）。"""
+        return self.state_dir / "typing_ticket.json"
+
+    def _get_typing_ticket(self, to_user_id, context_token=""):
+        """取 typing ticket：缓存未过期（约 9 分钟）直接复用，过期重新调 getConfig。
+
+        返回 ticket 字符串；取不到（无凭证、接口失败、ret 非 0、响应缺 ticket）
+        返回 None，由调用方静默降级。ticket 登记进脱敏器，绝不写日志。
+        """
+        cached = _load_json(self.typing_ticket_path)
+        if isinstance(cached, dict) and cached.get("ilink_user_id") == to_user_id:
+            fetched_at = cached.get("fetched_at")
+            ticket = cached.get("typing_ticket")
+            if (isinstance(fetched_at, (int, float)) and ticket
+                    and time.time() - fetched_at < TYPING_TICKET_TTL):
+                self.redactor.add(ticket)
+                return ticket
+        session = self.load_session()
+        body = {"ilink_user_id": to_user_id, "base_info": _base_info()}
+        if context_token:
+            body["context_token"] = context_token
+        url = session["baseurl"].rstrip("/") + "/ilink/bot/getconfig"
+        resp = _http_json("POST", url, body, _auth_headers(session["bot_token"]),
+                          timeout=TYPING_HTTP_TIMEOUT)
+        # 缓存层只在 ret===0 时接受配置（协议“返回值和错误”一节）
+        if resp.get("ret") != 0:
+            return None
+        ticket = resp.get("typing_ticket")
+        if not ticket:
+            return None
+        self.redactor.add(ticket)
+        _write_json_0600(self.typing_ticket_path, {
+            "ilink_user_id": to_user_id,
+            "typing_ticket": ticket,
+            "fetched_at": time.time(),
+        })
+        return ticket
+
+    def send_typing(self, to_user_id, context_token, typing):
+        """发“正在输入”状态（typing=True 亮起，False 熄灭）。返回是否发出。
+
+        失败一律静默降级：取不到 ticket、网络错误、没登录都只记一条日志
+        并返回 False，绝不抛错、绝不阻塞回复。按协议，sendTyping 不解析
+        响应体、不检查业务返回码，HTTP 成功即算发出。
+        """
+        try:
+            ticket = self._get_typing_ticket(to_user_id, context_token or "")
+            if not ticket:
+                self.log("info", "typing ticket 取不到，跳过正在输入（静默降级）")
+                return False
+            session = self.load_session()
+            body = {
+                "ilink_user_id": to_user_id,
+                "typing_ticket": ticket,
+                "status": TYPING_STATUS_START if typing else TYPING_STATUS_CANCEL,
+                "base_info": _base_info(),
+            }
+            url = session["baseurl"].rstrip("/") + "/ilink/bot/sendtyping"
+            _http_json("POST", url, body, _auth_headers(session["bot_token"]),
+                       timeout=TYPING_HTTP_TIMEOUT)
+            return True
+        except Exception as exc:  # noqa: BLE001 - typing 失败绝不阻塞回复
+            self.log("info", f"正在输入发送失败，静默降级：{exc}")
+            return False
 
     def _upload_media_file(self, path, to_user_id, kind):
         """把一个本地文件上传到微信 CDN，返回上传信息字典（见 media.py）。"""
@@ -1127,8 +1271,10 @@ class Bridge:
         else:
             text = sys.stdin.read()
         text = text.rstrip("\n")
-        if not text.strip():
-            raise BridgeError("要发送的文本为空")
+        guard_error = _body_guard_error(text)
+        if guard_error:
+            self.log("warning", f"正文守卫拒发：{guard_error}（send 命令，未发出）")
+            raise BridgeError(guard_error)
         ok, confirmed, errmsg = self.send_message(
             args.to, args.context_token or "", text
         )
@@ -1217,6 +1363,9 @@ class Bridge:
                     self.set_status(message_id, "sent",
                                     note="" if confirmed else "无 ret，HTTP 成功即记 sent")
                     self.log("info", f"{message_id} 媒体回复已发出，记 sent")
+                    # 回复已发出：熄灭“正在输入”（失败静默降级，不影响结果）
+                    self.send_typing(record.get("from_user_id"),
+                                     record.get("context_token") or "", False)
                     print(f"{message_id} 已发出，记 sent。")
                     return 0
                 self.set_status(message_id, "pending-send", note=errmsg)
@@ -1227,8 +1376,11 @@ class Bridge:
             if not outbox_file.exists():
                 raise BridgeError(f"outbox 里没有 {message_id}.txt，先写好回复再发")
             text = outbox_file.read_text(encoding="utf-8").rstrip("\n")
-            if not text.strip():
-                raise BridgeError("要发送的文本为空")
+            guard_error = _body_guard_error(text)
+            if guard_error:
+                self.log("warning",
+                         f"{message_id} 正文守卫拒发：{guard_error}（未发出）")
+                raise BridgeError(guard_error)
             ok, confirmed, errmsg = self.send_message(
                 record.get("from_user_id"), record.get("context_token") or "", text
             )
@@ -1236,6 +1388,9 @@ class Bridge:
                 self.set_status(message_id, "sent",
                                 note="" if confirmed else "无 ret，HTTP 成功即记 sent")
                 self.log("info", f"{message_id} 回复已发出，记 sent")
+                # 回复已发出：熄灭“正在输入”（失败静默降级，不影响结果）
+                self.send_typing(record.get("from_user_id"),
+                                 record.get("context_token") or "", False)
                 print(f"{message_id} 已发出，记 sent。")
                 return 0
             self.set_status(message_id, "pending-send", note=errmsg)
@@ -1262,8 +1417,11 @@ class Bridge:
         else:
             text = sys.stdin.read()
         text = text.rstrip("\n")
-        if not text.strip():
-            raise BridgeError("要发送的文本为空")
+        guard_error = _body_guard_error(text)
+        if guard_error:
+            self.log("warning",
+                     f"{message_id} 正文守卫拒发：{guard_error}（note {key}，未发出）")
+            raise BridgeError(guard_error)
         with self._status_lock():
             data = self._load_status()
             entry = data.get(message_id) or {}
@@ -1286,6 +1444,11 @@ class Bridge:
                 data[message_id] = entry
                 _atomic_write_json(self.state_dir / "status.json", data)
                 self.log("info", f"{message_id} 附加消息 {key} 已发出（{len(text)} 字）")
+                if key == "ack":
+                    # 收到确认已发出：亮起“正在输入”，让用户知道已在处理
+                    # （失败静默降级，不影响 ack 结果）
+                    self.send_typing(record.get("from_user_id"),
+                                     record.get("context_token") or "", True)
                 print(f"{message_id} 的 {key} 已发出。")
                 return 0
             self.log("warning", f"{message_id} 附加消息 {key} 发送失败：{errmsg}")
@@ -1345,12 +1508,23 @@ class Bridge:
             print("最近活动：无")
         return 0
 
+    # -- 命令：pending ----------------------------------------------------------
+
+    def cmd_pending(self, args):
+        """列出 received 状态的待处理消息（JSON 数组，供 worker 做连发合并判定）。"""
+        print(json.dumps(self.list_pending(args.from_user_id or None),
+                         ensure_ascii=False))
+        return 0
+
     # -- 命令：mark -----------------------------------------------------------
 
     def cmd_mark(self, args):
-        """推进一条消息的状态（供外部 worker 调用）。"""
+        """推进一条消息的状态（供外部 worker 调用）。
+
+        --note 可选备注（连发合并时写“已合并到 <最新 message_id>”留痕）。
+        """
         try:
-            self.set_status(args.message_id, args.state)
+            self.set_status(args.message_id, args.state, note=args.note or "")
         except ValueError as exc:
             raise BridgeError(str(exc)) from exc
         print(f"{args.message_id} -> {args.state}")
@@ -1405,9 +1579,16 @@ def build_parser():
 
     sub.add_parser("status", help="显示登录状态、serve 状态、inbox 计数、最近活动")
 
+    pending_parser = sub.add_parser(
+        "pending", help="列出 received 状态的待处理消息（JSON，供连发合并判定）")
+    pending_parser.add_argument("--from", dest="from_user_id", default="",
+                                help="只列该发送人的（from_user_id）")
+
     mark_parser = sub.add_parser("mark", help="推进一条消息的状态（供外部 worker 调用）")
     mark_parser.add_argument("message_id", help="消息 ID")
     mark_parser.add_argument("state", choices=list(STATUSES), help="新状态")
+    mark_parser.add_argument("--note", default="",
+                             help="可选备注（如连发合并时写“已合并到 <最新消息 ID>”）")
     return parser
 
 
@@ -1432,6 +1613,8 @@ def main(argv=None):
             return bridge.cmd_send_media(args)
         if args.command == "status":
             return bridge.cmd_status()
+        if args.command == "pending":
+            return bridge.cmd_pending(args)
         if args.command == "mark":
             return bridge.cmd_mark(args)
     except BridgeError as exc:

@@ -17,6 +17,12 @@
    不同 key 各发各的；不碰主状态；失败不记 key 可重试；非法 key 与空文本被拒绝）
 ⑧ 只重试 407（最多 3 次、各等 5 秒）；连接中断与服务端错误不重试
    （中断时消息可能已发出，重试会把同一条消息再发一遍）
+⑨ 正文守卫（为空或以 -- 开头拒发：send_message/send-once/note/send
+   与媒体说明文字都拦，合法正文放行）
+⑩ 正在输入（getConfig 取 typing_ticket 缓存 9 分钟、sendTyping
+   start/cancel 的 payload 与协议一致；失败静默降级不阻塞；
+   ack 亮起、send-once 熄灭）
+⑪ 连发合并支撑（pending 列同发送人 received、merged 状态与备注）
 
 用法：.venv/bin/python selftest.py
 全部通过退出码 0，任一项失败退出码 1。
@@ -478,6 +484,221 @@ def test_http_json_proxy_retry():
         bridge.time.sleep = real_sleep
 
 
+def test_body_guard():
+    """⑨ 正文守卫：为空或以 -- 开头拒发，各发送路径都拦。"""
+    # 判定函数本身
+    assert bridge._body_guard_error("") is not None
+    assert bridge._body_guard_error("  \n ") is not None
+    assert bridge._body_guard_error("--key ack") is not None
+    assert bridge._body_guard_error("  --foo") is not None
+    assert bridge._body_guard_error(None) is not None
+    assert bridge._body_guard_error("你好") is None
+    assert bridge._body_guard_error("结果是 a--b") is None
+    assert bridge._body_guard_error("- 单横线开头不算") is None
+
+    with tempfile.TemporaryDirectory() as tmp:
+        b = _make_bridge(tmp)
+        # send_message 守卫在联网之前：-- 开头直接拒发，不需要登录
+        ok, confirmed, errmsg = b.send_message("owner123", "ctx", "--key ack")
+        assert not ok and "正文守卫" in errmsg, errmsg
+        ok, confirmed, errmsg = b.send_message("owner123", "ctx", "   ")
+        assert not ok and "正文守卫" in errmsg, errmsg
+
+        # note：-- 开头被拒，mock 发送不应被调，key 不记
+        inbox_file = Path(tmp) / "inbox" / "999.json"
+        inbox_file.write_text(json.dumps({
+            "message_id": 999, "from_user_id": "owner123",
+            "context_token": "ctx999", "text": "任务",
+        }, ensure_ascii=False), encoding="utf-8")
+        b.set_status(999, "executing")
+        bad_file = Path(tmp) / "bad.txt"
+        bad_file.write_text("--key ack", encoding="utf-8")
+        calls = []
+        real_send = Bridge.send_message
+        Bridge.send_message = lambda self, to, ctx, text: calls.append(text) or (True, True, "")
+        try:
+            try:
+                b.cmd_note(argparse.Namespace(message_id="999", key="ack",
+                                              text_file=str(bad_file)))
+            except BridgeError as exc:
+                assert "正文守卫" in str(exc)
+            else:
+                raise AssertionError("note 正文以 -- 开头应被拒绝")
+        finally:
+            Bridge.send_message = real_send
+        assert calls == [], "守卫拒发时不应调发送"
+        status = json.loads((Path(tmp) / "state" / "status.json").read_text(encoding="utf-8"))
+        assert "notes" not in status["999"], "守卫拒发不应记 key"
+
+        # send-once：outbox 文本以 -- 开头被拒，状态不变
+        (Path(tmp) / "outbox" / "999.txt").write_text("--key", encoding="utf-8")
+        b.set_status(999, "pending-send")
+        try:
+            b.cmd_send_once(argparse.Namespace(message_id="999"))
+        except BridgeError as exc:
+            assert "正文守卫" in str(exc)
+        else:
+            raise AssertionError("send-once 正文以 -- 开头应被拒绝")
+        status = json.loads((Path(tmp) / "state" / "status.json").read_text(encoding="utf-8"))
+        assert status["999"]["status"] == "pending-send", "守卫拒发不应记 sent"
+
+        # send 命令：-- 开头被拒
+        try:
+            b.cmd_send(argparse.Namespace(to="owner123", context_token="ctx",
+                                          text_file=str(bad_file)))
+        except BridgeError as exc:
+            assert "正文守卫" in str(exc)
+        else:
+            raise AssertionError("send 正文以 -- 开头应被拒绝")
+
+        # 媒体说明文字：-- 开头时说明文字先被守卫拦下，不上传、不发媒体
+        doc = Path(tmp) / "doc.pdf"
+        doc.write_bytes(b"%PDF-fake")
+        upload_calls = []
+        ok, _, errmsg = b.send_media(
+            "owner123", "ctx", doc, "file", caption="--caption",
+            uploader=lambda path, to, kind: upload_calls.append(path) or {})
+        assert not ok and "说明文字" in errmsg, errmsg
+        assert upload_calls == [], "说明文字被守卫拒发时不应上传媒体"
+
+
+def test_typing():
+    """⑩ 正在输入：payload 与协议一致、ticket 缓存 9 分钟、失败静默降级。"""
+    with tempfile.TemporaryDirectory() as tmp:
+        b = _make_bridge(tmp)
+        (Path(tmp) / "state" / "session.json").write_text(json.dumps({
+            "bot_token": "fake-token-0123456789", "ilink_bot_id": "bot1",
+            "baseurl": "https://ilinkai.weixin.qq.com",
+            "ilink_user_id": "owner123",
+        }), encoding="utf-8")
+        http_calls = []
+
+        def fake_http(method, url, body=None, headers=None, timeout=35):
+            http_calls.append((method, url, body))
+            if url.endswith("/ilink/bot/getconfig"):
+                return {"ret": 0, "typing_ticket": "ticket-abc-123456789"}
+            if url.endswith("/ilink/bot/sendtyping"):
+                return {}
+            raise AssertionError(f"意外 URL：{url}")
+
+        real_http = bridge._http_json
+        bridge._http_json = fake_http
+        try:
+            # 亮起：先 getConfig 再 sendTyping(status=1)
+            assert b.send_typing("owner123", "ctx1", True) is True
+            assert len(http_calls) == 2, http_calls
+            cfg = http_calls[0]
+            assert cfg[0] == "POST" and cfg[1].endswith("/ilink/bot/getconfig")
+            assert cfg[2]["ilink_user_id"] == "owner123"
+            assert cfg[2]["context_token"] == "ctx1"
+            assert "base_info" in cfg[2]
+            typ = http_calls[1]
+            assert typ[1].endswith("/ilink/bot/sendtyping")
+            assert typ[2]["ilink_user_id"] == "owner123"
+            assert typ[2]["typing_ticket"] == "ticket-abc-123456789"
+            assert typ[2]["status"] == 1, "status=1 表示正在输入"
+            assert "base_info" in typ[2]
+            # 熄灭：缓存命中，不再调 getConfig，status=2
+            http_calls.clear()
+            assert b.send_typing("owner123", "ctx1", False) is True
+            assert len(http_calls) == 1, "缓存期内不应重取 ticket"
+            assert http_calls[0][2]["status"] == 2, "status=2 表示取消输入"
+            # 缓存过期（fetched_at 超过 9 分钟）：重新取
+            cache_path = Path(tmp) / "state" / "typing_ticket.json"
+            cache = json.loads(cache_path.read_text(encoding="utf-8"))
+            cache["fetched_at"] = time.time() - bridge.TYPING_TICKET_TTL - 1
+            cache_path.write_text(json.dumps(cache), encoding="utf-8")
+            http_calls.clear()
+            assert b.send_typing("owner123", "ctx1", True) is True
+            assert len(http_calls) == 2, "过期后应重新取 ticket"
+            # 换发送人：缓存不复用，重新取
+            http_calls.clear()
+            assert b.send_typing("other999", "ctx2", True) is True
+            assert len(http_calls) == 2, "不同用户不应复用缓存"
+            # getConfig ret 非 0：静默降级返回 False，不抛错
+            bridge._http_json = lambda *a, **kw: {"ret": -1, "typing_ticket": "x"}
+            cache_path.unlink()
+            assert b.send_typing("owner123", "ctx1", True) is False
+            # 网络错误：静默降级返回 False，不抛错
+            def boom(*a, **kw):
+                raise BridgeError("网络错误：Remote end closed")
+            bridge._http_json = boom
+            assert b.send_typing("owner123", "ctx1", True) is False
+        finally:
+            bridge._http_json = real_http
+
+    # 挂接点：ack 发出后亮起、send-once 发出后熄灭；typing 失败不影响发送结果
+    with tempfile.TemporaryDirectory() as tmp:
+        b = _make_bridge(tmp)
+        inbox_file = Path(tmp) / "inbox" / "555.json"
+        inbox_file.write_text(json.dumps({
+            "message_id": 555, "from_user_id": "owner123",
+            "context_token": "ctx555", "text": "任务",
+        }, ensure_ascii=False), encoding="utf-8")
+        (Path(tmp) / "outbox" / "555.txt").write_text("做完了。", encoding="utf-8")
+        ack_file = Path(tmp) / "ack.txt"
+        ack_file.write_text("收到：任务，约几分钟后反馈。", encoding="utf-8")
+        b.set_status(555, "executing")
+        typing_calls = []
+        real_send = Bridge.send_message
+        real_typing = Bridge.send_typing
+        Bridge.send_message = lambda self, to, ctx, text: (True, True, "")
+        Bridge.send_typing = lambda self, to, ctx, t: typing_calls.append((to, ctx, t)) or False
+        try:
+            assert b.cmd_note(argparse.Namespace(
+                message_id="555", key="ack", text_file=str(ack_file))) == 0
+            assert typing_calls == [("owner123", "ctx555", True)], typing_calls
+            # 非 ack 的 note 不亮 typing
+            typing_calls.clear()
+            assert b.cmd_note(argparse.Namespace(
+                message_id="555", key="delay", text_file=str(ack_file))) == 0
+            assert typing_calls == [], "delay 不应亮 typing"
+            # send-once 成功后熄灭；typing 返回 False 也不影响退出码
+            b.set_status(555, "pending-send")
+            assert b.cmd_send_once(argparse.Namespace(message_id="555")) == 0
+            assert typing_calls == [("owner123", "ctx555", False)], typing_calls
+        finally:
+            Bridge.send_message = real_send
+            Bridge.send_typing = real_typing
+
+
+def test_burst_merge_support():
+    """⑪ 连发合并支撑：pending 列同发送人 received、merged 状态与备注。"""
+    with tempfile.TemporaryDirectory() as tmp:
+        b = _make_bridge(tmp)
+        for mid, sender, ts in ((101, "owner123", 1000), (102, "owner123", 2000),
+                                (103, "owner123", 3000), (104, "other999", 2500)):
+            (Path(tmp) / "inbox" / f"{mid}.json").write_text(json.dumps({
+                "message_id": mid, "from_user_id": sender,
+                "context_token": f"ctx{mid}", "create_time_ms": ts,
+                "type": "text", "text": f"消息{mid}",
+            }, ensure_ascii=False), encoding="utf-8")
+            b.set_status(mid, "received")
+        # pending：按时间升序；按发送人过滤
+        pending = b.list_pending()
+        assert [p["message_id"] for p in pending] == ["101", "102", "104", "103"], pending
+        owner_pending = b.list_pending("owner123")
+        assert [p["message_id"] for p in owner_pending] == ["101", "102", "103"]
+        assert owner_pending[0]["type"] == "text"
+        # merged 状态 + 备注（mark --note）：被合并的消息不再出现在 pending
+        assert b.cmd_mark(argparse.Namespace(
+            message_id="101", state="merged", note="已合并到 103")) == 0
+        assert b.cmd_mark(argparse.Namespace(
+            message_id="102", state="merged", note="已合并到 103")) == 0
+        status = json.loads((Path(tmp) / "state" / "status.json").read_text(encoding="utf-8"))
+        assert status["101"]["status"] == "merged"
+        assert status["101"]["note"] == "已合并到 103"
+        assert [p["message_id"] for p in b.list_pending("owner123")] == ["103"], \
+            "merged 后只剩最新一条"
+        # 非法状态仍被拒绝
+        try:
+            b.set_status(103, "done")
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("非法状态应被拒绝")
+
+
 TESTS = [
     ("① 二维码编解码往返与载荷判定", test_qr_roundtrip),
     ("② 消息过滤与非文字固定回复", test_filtering),
@@ -487,6 +708,9 @@ TESTS = [
     ("⑥ send-once 只发一次与无 ret 记 sent", test_send_once),
     ("⑦ note 附加消息只发一次与不碰主状态", test_note),
     ("⑧ 只重试 407，连接中断与服务端错误不重试", test_http_json_proxy_retry),
+    ("⑨ 正文守卫拒发空正文与 -- 开头", test_body_guard),
+    ("⑩ 正在输入 payload/缓存/静默降级与挂接点", test_typing),
+    ("⑪ 连发合并支撑 pending 与 merged 状态", test_burst_merge_support),
 ]
 
 
